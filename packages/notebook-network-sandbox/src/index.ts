@@ -6,9 +6,12 @@ import {
   setWindowsRuntimeAccess,
   getWindowsRuntimeAccess,
   isWindowsProtectionConfigured,
+  preflightWindowsFilesystem,
   removeWindows,
   statusForPlatform,
   type SandboxDependencyCheck,
+  type WindowsAclPreflightRequest,
+  type WindowsAclPreflightResult,
   type WindowsShell,
   type WindowsRuntimeVerification
 } from '../runtime/src/index.js'
@@ -380,6 +383,36 @@ class NotebookNetworkSandbox {
       throw new Error('Windows protection is only available on Windows.')
     // Configuration is independent of runtime readiness, including an in-flight fence probe.
     return isWindowsProtectionConfigured(createRuntimeConfig(this.#options))
+  }
+
+  /** Read-only protected-mode validation before a folder grant is persisted. */
+  async preflightGrantedRoot(
+    path: string,
+    access: 'ro' | 'rw',
+    requestedPath = path,
+    options: { signal?: AbortSignal; filesystem?: WindowsAclPreflightRequest['filesystem'] } = {}
+  ): Promise<void> {
+    options.signal?.throwIfAborted()
+    if (process.platform !== 'win32') return
+    const config = createRuntimeConfig(this.#options)
+    if (!(await isWindowsProtectionConfigured(config))) return
+    options.signal?.throwIfAborted()
+    const request: WindowsAclPreflightRequest = {
+      path,
+      access,
+      requestedPath,
+      filesystem: options.filesystem
+    }
+    const result: WindowsAclPreflightResult = await preflightWindowsFilesystem(
+      config,
+      request,
+      options.signal
+    )
+    if (result.ok) return
+    const failure = result.error
+    throw new Error(
+      `WINDOWS_ACL_PREFLIGHT_FAILED: code=${failure.code} path=${failure.path} access=${failure.access} stage=${failure.stage}${failure.win32Code === undefined ? '' : ` win32Code=${failure.win32Code}`}: ${failure.message}. ${failure.remediation}`
+    )
   }
 
   async getWindowsRuntimeAccess(

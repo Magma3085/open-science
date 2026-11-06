@@ -53,6 +53,7 @@ const backend = vi.hoisted(() => ({
   installWindows: vi.fn().mockResolvedValue({ cancelled: false }),
   removeWindows: vi.fn().mockResolvedValue({ cancelled: false }),
   isWindowsProtectionConfigured: vi.fn().mockResolvedValue(true),
+  preflightGrantedRoot: vi.fn().mockResolvedValue(undefined),
   getWindowsRuntimeAccess: vi.fn().mockResolvedValue({ authorized: true, registered: true }),
   setWindowsRuntimeAccess: vi.fn().mockResolvedValue({ cancelled: false }),
   rKernelProtocolProbe: vi.fn().mockResolvedValue(true),
@@ -85,6 +86,7 @@ vi.mock('@aipoch/notebook-network-sandbox', () => ({
     installWindows = backend.installWindows
     removeWindows = backend.removeWindows
     isWindowsProtectionConfigured = backend.isWindowsProtectionConfigured
+    preflightGrantedRoot = backend.preflightGrantedRoot
     getWindowsRuntimeAccess = backend.getWindowsRuntimeAccess
     setWindowsRuntimeAccess = backend.setWindowsRuntimeAccess
     dispose = backend.dispose
@@ -142,6 +144,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   backend.status.mockResolvedValue({ kind: 'ready', warnings: [] })
   backend.isWindowsProtectionConfigured.mockResolvedValue(true)
+  backend.preflightGrantedRoot.mockReset().mockResolvedValue(undefined)
   backend.getWindowsRuntimeAccess.mockResolvedValue({ authorized: true, registered: true })
   backend.setWindowsRuntimeAccess.mockImplementation(
     async (_executable, authorized: boolean, verification?: Verification) => {
@@ -223,6 +226,226 @@ afterEach(async () => {
 })
 
 describe('NotebookNetworkSandboxOwner', () => {
+  it('preflights granted roots only in Windows protected mode', async () => {
+    const owner = new NotebookNetworkSandboxOwner({
+      resourceRoot: '/resources',
+      platform: 'win32',
+      getSettings: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+      persistAlwaysAllow: vi.fn(),
+      requestDecision: vi.fn()
+    })
+
+    await owner.preflightGrantedRoot('C:\\data', 'rw', 'C:\\alias')
+
+    expect(backend.preflightGrantedRoot).toHaveBeenCalledExactlyOnceWith(
+      'C:\\data',
+      'rw',
+      'C:\\alias',
+      expect.objectContaining({
+        filesystem: expect.objectContaining({ readOnlyRoots: ['C:\\data'] })
+      })
+    )
+    await owner.dispose()
+  })
+
+  it('does not ACL-preflight granted roots in Windows standard mode', async () => {
+    backend.isWindowsProtectionConfigured.mockResolvedValueOnce(false)
+    const owner = new NotebookNetworkSandboxOwner({
+      resourceRoot: '/resources',
+      platform: 'win32',
+      getSettings: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+      persistAlwaysAllow: vi.fn(),
+      requestDecision: vi.fn()
+    })
+
+    await expect(owner.preflightGrantedRoot('C:\\data', 'ro')).resolves.toBeUndefined()
+
+    expect(backend.preflightGrantedRoot).not.toHaveBeenCalled()
+    await owner.dispose()
+  })
+
+  it('does not ACL-preflight granted roots outside Windows', async () => {
+    const owner = new NotebookNetworkSandboxOwner({
+      resourceRoot: '/resources',
+      platform: 'darwin',
+      getSettings: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+      persistAlwaysAllow: vi.fn(),
+      requestDecision: vi.fn()
+    })
+
+    await expect(owner.preflightGrantedRoot('/Users/test/data', 'ro')).resolves.toBeUndefined()
+
+    expect(backend.isWindowsProtectionConfigured).not.toHaveBeenCalled()
+    expect(backend.preflightGrantedRoot).not.toHaveBeenCalled()
+    await owner.dispose()
+  })
+
+  it('returns the native preflight failure details unchanged', async () => {
+    const failure = new Error(
+      'Path: D:\\spss\nStage: inspect-selected-path\nWin32 error: 5 (ERROR_ACCESS_DENIED)\nRemediation: choose a local NTFS folder you own.'
+    )
+    backend.preflightGrantedRoot.mockRejectedValueOnce(failure)
+    const owner = new NotebookNetworkSandboxOwner({
+      resourceRoot: '/resources',
+      platform: 'win32',
+      getSettings: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+      persistAlwaysAllow: vi.fn(),
+      requestDecision: vi.fn()
+    })
+
+    await expect(owner.preflightGrantedRoot('D:\\spss', 'rw')).rejects.toThrow(failure.message)
+
+    await owner.dispose()
+  })
+
+  it('rechecks protected-mode grants before creating a command root or wrapping the kernel', async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), 'os-grant-preflight-'))
+    fixtureDirectories.push(fixtureRoot)
+    const managedRoot = join(fixtureRoot, 'commands')
+    const failure = new Error('Win32 error: 5 (ERROR_ACCESS_DENIED)')
+    backend.preflightGrantedRoot.mockRejectedValueOnce(failure)
+    const owner = new NotebookNetworkSandboxOwner({
+      resourceRoot: fixtureRoot,
+      temporaryRoot: managedRoot,
+      platform: 'win32',
+      getGrantedLocalRoots: async () => [
+        { id: 'spss', name: 'SPSS', path: 'D:\\spss', access: 'rw' }
+      ],
+      getSettings: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+      persistAlwaysAllow: vi.fn(),
+      requestDecision: vi.fn()
+    })
+
+    await expect(
+      owner.wrap({
+        executable: 'python.exe',
+        args: ['-c', 'print(1)'],
+        env: {},
+        cwd: fixtureRoot,
+        commandText: 'print(1)',
+        sessionId: 'session',
+        projectId: 'project',
+        runtime: 'repl',
+        windowsProtectionRequired: true,
+        filesystem: {
+          readOnlyRoots: [],
+          readWriteRoots: [],
+          deniedReadRoots: [],
+          deniedWriteRoots: []
+        }
+      })
+    ).rejects.toThrow(failure.message)
+
+    expect(backend.preflightGrantedRoot).toHaveBeenCalledExactlyOnceWith(
+      'D:\\spss',
+      'rw',
+      'D:\\spss',
+      expect.objectContaining({
+        filesystem: expect.objectContaining({ readWriteRoots: ['D:\\spss'] })
+      })
+    )
+    expect(backend.wrap).not.toHaveBeenCalled()
+    expect(existsSync(managedRoot)).toBe(false)
+    await owner.dispose()
+  })
+
+  it('passes execution boundaries to preflight and stops checking directories after cancellation', async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), 'os-cancel-grant-preflight-'))
+    fixtureDirectories.push(fixtureRoot)
+    const controller = new AbortController()
+    const reason = new Error('user cancelled')
+    backend.preflightGrantedRoot.mockImplementationOnce(
+      async (_path, _access, _requested, options) => {
+        expect(options.signal).toBe(controller.signal)
+        expect(options.filesystem.deniedReadRoots).toEqual([join(fixtureRoot, 'protected')])
+        expect(options.filesystem.deniedWriteRoots).toContain(join(fixtureRoot, 'readonly'))
+        controller.abort(reason)
+      }
+    )
+    const owner = new NotebookNetworkSandboxOwner({
+      resourceRoot: fixtureRoot,
+      temporaryRoot: join(fixtureRoot, 'commands'),
+      platform: 'win32',
+      getGrantedLocalRoots: async () => [
+        { id: 'a', name: 'a', path: 'D:\\data', access: 'rw' },
+        { id: 'b', name: 'b', path: 'D:\\other', access: 'ro' }
+      ],
+      getSettings: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+      persistAlwaysAllow: vi.fn(),
+      requestDecision: vi.fn()
+    })
+    try {
+      await expect(
+        owner.wrap({
+          executable: 'python.exe',
+          args: ['-c', 'print(1)'],
+          env: {},
+          cwd: fixtureRoot,
+          commandText: 'print(1)',
+          sessionId: 'session',
+          projectId: 'project',
+          runtime: 'repl',
+          windowsProtectionRequired: true,
+          signal: controller.signal,
+          filesystem: {
+            readOnlyRoots: [],
+            readWriteRoots: [],
+            deniedReadRoots: [join(fixtureRoot, 'protected')],
+            deniedWriteRoots: [join(fixtureRoot, 'readonly')]
+          }
+        })
+      ).rejects.toBe(reason)
+      expect(backend.preflightGrantedRoot).toHaveBeenCalledTimes(1)
+      expect(backend.wrap).not.toHaveBeenCalled()
+      expect(existsSync(join(fixtureRoot, 'commands'))).toBe(false)
+    } finally {
+      await owner.dispose()
+    }
+  })
+
+  it('does not ACL-preflight grants for standard-mode kernel execution', async () => {
+    const fixtureRoot = await mkdtemp(join(tmpdir(), 'os-standard-grant-preflight-'))
+    fixtureDirectories.push(fixtureRoot)
+    const owner = new NotebookNetworkSandboxOwner({
+      resourceRoot: fixtureRoot,
+      temporaryRoot: join(fixtureRoot, 'commands'),
+      platform: 'win32',
+      getGrantedLocalRoots: async () => [
+        { id: 'data', name: 'data', path: 'D:\\data', access: 'ro' }
+      ],
+      getSettings: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+      persistAlwaysAllow: vi.fn(),
+      requestDecision: vi.fn()
+    })
+    let wrapped: Awaited<ReturnType<typeof owner.wrap>> | undefined
+
+    try {
+      wrapped = await owner.wrap({
+        executable: 'python.exe',
+        args: ['-c', 'print(1)'],
+        env: {},
+        cwd: fixtureRoot,
+        commandText: 'print(1)',
+        sessionId: 'session',
+        projectId: 'project',
+        runtime: 'repl',
+        windowsProtectionRequired: false,
+        filesystem: {
+          readOnlyRoots: [],
+          readWriteRoots: [],
+          deniedReadRoots: [],
+          deniedWriteRoots: []
+        }
+      })
+
+      expect(backend.preflightGrantedRoot).not.toHaveBeenCalled()
+      expect(backend.wrap).toHaveBeenCalledOnce()
+    } finally {
+      await wrapped?.cleanup('exit', { processesTerminated: true })
+      await owner.dispose()
+    }
+  })
+
   it.each([
     { visitSettings: false, background: false, failure: undefined },
     { visitSettings: true, background: false, failure: undefined },
@@ -401,6 +624,7 @@ describe('NotebookNetworkSandboxOwner', () => {
         await manager.store.deps.probe(selection)
 
         expect(getGrantedLocalRoots).not.toHaveBeenCalled()
+        expect(backend.preflightGrantedRoot).not.toHaveBeenCalled()
         expect(probeInvocation?.filesystem.readOnlyRoots).not.toContain(deniedRoot)
         expect(probeInvocation?.filesystem.readWriteRoots).not.toContain(deniedRoot)
       } finally {

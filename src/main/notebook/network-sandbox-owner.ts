@@ -65,7 +65,8 @@ import {
   type NotebookTrustBundle,
   type NotebookTrustBundleStatus
 } from './trust-bundle'
-import type { GrantedLocalRoot } from '../../shared/local-fs'
+import { getAppClaudeConfigDir } from '../settings/provider-env'
+import type { GrantedLocalRoot, GrantedLocalRootAccess } from '../../shared/local-fs'
 import { kernelExecutableReadRoot } from './kernel-executor'
 import { windowsCondaPrefixForR } from '@aipoch/environment'
 import { rKernelProtocolProbe } from '@aipoch/environment'
@@ -366,6 +367,29 @@ class NotebookNetworkSandboxOwner implements NotebookProcessSandbox {
     return true
   }
 
+  async preflightGrantedRoot(
+    path: string,
+    access: GrantedLocalRootAccess,
+    requestedPath?: string
+  ): Promise<void> {
+    if (this.platform !== 'win32') return
+    if (!(await this.windowsProtectionConfigured())) return
+    const filesystem = {
+      readOnlyRoots: [path],
+      readWriteRoots: access === 'rw' ? [path] : [],
+      deniedReadRoots: this.options.configRoot
+        ? [getAppClaudeConfigDir(this.options.configRoot)]
+        : [],
+      deniedWriteRoots: [
+        ...(this.options.configRoot ? await managedSkillReadRoots(this.options.configRoot) : []),
+        ...protectedWriteRoots(access === 'rw' ? [path] : [])
+      ]
+    }
+    await this.getOrCreateSandbox().preflightGrantedRoot(path, access, requestedPath, {
+      filesystem
+    })
+  }
+
   async resolveWindowsRuntime(request: {
     runtime: 'repl' | 'bash'
     binding?: ShellRuntimeBinding
@@ -535,6 +559,51 @@ class NotebookNetworkSandboxOwner implements NotebookProcessSandbox {
     const skillReadRoots = this.options.configRoot
       ? await managedSkillReadRoots(this.options.configRoot)
       : []
+    const filesystem = {
+      restrictFolders,
+      privateRoot: homedir(),
+      readOnlyRoots: [
+        ...invocation.filesystem.readOnlyRoots,
+        ...skillReadRoots,
+        ...(invocation.target?.kind === 'wsl2' || this.platform === 'win32'
+          ? []
+          : environmentPathRoots(invocation.env, this.platform)),
+        ...grantedRoots.map((root) => root.path),
+        ...(this.trustBundle ? [this.trustBundle.path] : [])
+      ],
+      ...(this.platform === 'win32' && invocation.target?.kind !== 'wsl2'
+        ? {
+            optionalReadOnlyRoots: [
+              ...(invocation.filesystem.optionalReadOnlyRoots ?? []),
+              ...environmentPathRoots(invocation.env, this.platform)
+            ]
+          }
+        : {}),
+      readWriteRoots: [
+        ...invocation.filesystem.readWriteRoots,
+        ...grantedRoots.filter((root) => root.access === 'rw').map((root) => root.path)
+      ],
+      deniedReadRoots: invocation.filesystem.deniedReadRoots,
+      deniedWriteRoots: [
+        ...invocation.filesystem.deniedWriteRoots,
+        ...skillReadRoots,
+        ...protectedWriteRoots([
+          ...invocation.filesystem.readWriteRoots,
+          ...grantedRoots.filter((root) => root.access === 'rw').map((root) => root.path)
+        ]),
+        ...(this.trustBundle ? [this.trustBundle.path] : [])
+      ]
+    }
+    if (nativeWindows && windowsProtectionRequired === true) {
+      for (const root of grantedRoots) {
+        invocation.signal?.throwIfAborted()
+        await this.getOrCreateSandbox().preflightGrantedRoot(root.path, root.access, root.path, {
+          filesystem,
+          signal: invocation.signal
+        })
+        invocation.signal?.throwIfAborted()
+      }
+    }
     const { commandTempRoot, receipt, retained } = await this.createCommandTemporaryRoot(
       target,
       invocation.runtime
@@ -602,40 +671,8 @@ class NotebookNetworkSandboxOwner implements NotebookProcessSandbox {
           ? { windowsShellControlPipe: invocation.windowsShellControlPipe }
           : {}),
         filesystem: {
-          restrictFolders,
-          privateRoot: homedir(),
-          readOnlyRoots: [
-            ...invocation.filesystem.readOnlyRoots,
-            ...skillReadRoots,
-            ...(invocation.target?.kind === 'wsl2' || this.platform === 'win32'
-              ? []
-              : environmentPathRoots(env, this.platform)),
-            ...grantedRoots.map((root) => root.path),
-            ...(this.trustBundle ? [this.trustBundle.path] : [])
-          ],
-          ...(this.platform === 'win32' && invocation.target?.kind !== 'wsl2'
-            ? {
-                optionalReadOnlyRoots: [
-                  ...(invocation.filesystem.optionalReadOnlyRoots ?? []),
-                  ...environmentPathRoots(env, this.platform)
-                ]
-              }
-            : {}),
-          readWriteRoots: [
-            ...invocation.filesystem.readWriteRoots,
-            commandTempRoot,
-            ...grantedRoots.filter((root) => root.access === 'rw').map((root) => root.path)
-          ],
-          deniedReadRoots: invocation.filesystem.deniedReadRoots,
-          deniedWriteRoots: [
-            ...invocation.filesystem.deniedWriteRoots,
-            ...skillReadRoots,
-            ...protectedWriteRoots([
-              ...invocation.filesystem.readWriteRoots,
-              ...grantedRoots.filter((root) => root.access === 'rw').map((root) => root.path)
-            ]),
-            ...(this.trustBundle ? [this.trustBundle.path] : [])
-          ]
+          ...filesystem,
+          readWriteRoots: [...filesystem.readWriteRoots, commandTempRoot]
         },
         ...(invocation.signal ? { signal: invocation.signal } : {}),
         onNetworkAccessRequest: async (request) => {
