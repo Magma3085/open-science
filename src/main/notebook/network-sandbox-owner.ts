@@ -343,7 +343,9 @@ class NotebookNetworkSandboxOwner implements NotebookProcessSandbox {
         (selection, signal) =>
           probeWindowsRuntimeComponent(
             selection,
-            (request) => this.prepare(request),
+            // Runtime readiness must not inherit user folder grants: one denied ACL must not
+            // prevent every protected runtime from starting.
+            (request) => this.prepare(request, []),
             signal,
             (message) => this.log.warn(message)
           )
@@ -501,7 +503,10 @@ class NotebookNetworkSandboxOwner implements NotebookProcessSandbox {
     }
   }
 
-  private async prepare(invocation: NotebookSandboxInvocation): Promise<NotebookSandboxedSpawn> {
+  private async prepare(
+    invocation: NotebookSandboxInvocation,
+    grantedRootsOverride?: readonly GrantedLocalRoot[]
+  ): Promise<NotebookSandboxedSpawn> {
     const preparationStartedAt = performance.now()
     const nativeWindows = this.platform === 'win32' && invocation.target?.kind !== 'wsl2'
     const windowsProtectionRequired = nativeWindows
@@ -526,7 +531,7 @@ class NotebookNetworkSandboxOwner implements NotebookProcessSandbox {
     const target = invocation.target ?? { kind: 'native' as const }
     await this.reconcilePendingCommandCleanups(target)
     await this.updateTrustBundle()
-    const grantedRoots = (await this.options.getGrantedLocalRoots?.()) ?? []
+    const grantedRoots = grantedRootsOverride ?? (await this.options.getGrantedLocalRoots?.()) ?? []
     const skillReadRoots = this.options.configRoot
       ? await managedSkillReadRoots(this.options.configRoot)
       : []

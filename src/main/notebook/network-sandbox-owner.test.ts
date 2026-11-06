@@ -93,7 +93,10 @@ vi.mock('@aipoch/notebook-network-sandbox', () => ({
 
 import { NotebookNetworkSandboxOwner, commandLine } from './network-sandbox-owner'
 import { WindowsNotebookRuntimeManager } from './windows-runtime-manager'
-import { WindowsRuntimeComponentStore } from './windows-runtime-components'
+import {
+  WindowsRuntimeComponentStore,
+  type WindowsRuntimeComponentSelection
+} from './windows-runtime-components'
 import { NotebookRuntimeService } from './runtime-service'
 import { NotebookKernelExecutor } from './kernel-executor'
 import { runShellCommand } from './shell-process'
@@ -334,6 +337,74 @@ describe('NotebookNetworkSandboxOwner', () => {
         await service.shutdownAll()
         await owner.dispose()
         select.mockRestore()
+      }
+    }
+  )
+
+  it.each(['lookup failure', 'denied folder'] as const)(
+    'keeps runtime readiness independent of a user folder %s',
+    async (failure) => {
+      const root = await mkdtemp(join(tmpdir(), 'os-runtime-probe-scope-'))
+      fixtureDirectories.push(root)
+      const deniedRoot = join(root, 'spss')
+      const getGrantedLocalRoots = vi.fn(async () => {
+        if (failure === 'lookup failure') throw new Error('grant repository unavailable')
+        return [{ id: 'spss', name: 'SPSS', path: deniedRoot, access: 'rw' as const }]
+      })
+      let probeInvocation: NotebookSandboxInvocation | undefined
+      backend.wrap.mockImplementationOnce(async (command: NotebookSandboxInvocation) => {
+        probeInvocation = command
+        return {
+          argv: [process.execPath, '-e', 'process.stdout.write("RUNTIME_PROBE_OK")'],
+          env: command.env,
+          resetNetworkConnections: backend.resetNetworkConnections,
+          setExecutionActive: backend.setExecutionActive,
+          confirmProcessTreeTermination: async () => true,
+          annotateStderr: (stderr: string) => stderr,
+          cleanup: (
+            _reason: NotebookSandboxCleanupReason,
+            outcome: NotebookSandboxProcessOutcome
+          ) => backend.cleanup(outcome)
+        }
+      })
+      const owner = new NotebookNetworkSandboxOwner({
+        resourceRoot: root,
+        windowsRuntimeRoot: join(root, 'protected-runtimes'),
+        temporaryRoot: join(root, 'commands'),
+        platform: 'win32',
+        getGrantedLocalRoots,
+        getSettings: async () => DEFAULT_NOTEBOOK_NETWORK_SETTINGS,
+        persistAlwaysAllow: vi.fn(),
+        requestDecision: vi.fn()
+      })
+      const manager = (
+        owner as unknown as {
+          windowsRuntime: {
+            store: {
+              deps: {
+                probe: (
+                  selection: WindowsRuntimeComponentSelection,
+                  signal?: AbortSignal
+                ) => Promise<void>
+              }
+            }
+          }
+        }
+      ).windowsRuntime
+      const selection = {
+        release: { component: 'node', version: '22.0.0' },
+        root: join(root, 'runtime'),
+        executable: process.execPath
+      } as unknown as WindowsRuntimeComponentSelection
+
+      try {
+        await manager.store.deps.probe(selection)
+
+        expect(getGrantedLocalRoots).not.toHaveBeenCalled()
+        expect(probeInvocation?.filesystem.readOnlyRoots).not.toContain(deniedRoot)
+        expect(probeInvocation?.filesystem.readWriteRoots).not.toContain(deniedRoot)
+      } finally {
+        await owner.dispose()
       }
     }
   )
